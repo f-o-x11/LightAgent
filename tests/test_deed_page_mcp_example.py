@@ -26,7 +26,10 @@ def test_config_without_token_has_no_auth_header():
     module = load_example_module()
     config = module.deed_page_mcp_config(env={})
     server = config["mcpServers"]["deedpage"]
-    assert server == {"transport": "streamable-http", "url": "https://deed.page/mcp"}
+    assert server == {
+        "transport": "streamable-http", "url": "https://deed.page/mcp",
+        "namespace": "deedpage", "namespace_tools": True,
+    }
 
 
 def test_config_reads_token_from_environment_mapping():
@@ -41,7 +44,7 @@ def test_split_token_removes_owner_token():
     cleaned, token = module.split_token(text)
     assert token == "secret-token"
     assert "secret-token" not in cleaned
-    assert json.loads(cleaned) == {"url": "https://example.deed.page/", "token_saved": True}
+    assert json.loads(cleaned) == {"url": "https://example.deed.page/"}
 
 
 def test_split_token_leaves_other_text_unchanged():
@@ -61,18 +64,20 @@ def test_save_token_is_owner_only(tmp_path):
 def test_restrict_new_tools_keeps_local_and_allowed_tools():
     module = load_example_module()
     registry = ToolRegistry()
-    for name in ("local_tool", "publish_site", "get_site", "delete_site", "rotate_token"):
+    for name in ("local_tool", "publish_site", "other__delete_site", "deedpage__publish_site", "deedpage__get_site",
+                 "deedpage__delete_site", "deedpage__rotate_token"):
         registry.function_mappings[name] = object()
         registry.function_info[name] = {"tool_name": name}
         registry.openai_function_schemas.append(schema(name))
 
     removed = module.restrict_new_tools(registry, before={"local_tool"}, allowed=module.DEFAULT_ALLOWED_TOOLS)
 
-    assert sorted(removed) == ["delete_site", "rotate_token"]
-    assert sorted(registry.function_mappings) == ["get_site", "local_tool", "publish_site"]
-    assert sorted(registry.function_info) == ["get_site", "local_tool", "publish_site"]
+    assert sorted(removed) == ["deedpage__delete_site", "deedpage__rotate_token"]
+    expected = ["deedpage__get_site", "deedpage__publish_site", "local_tool", "other__delete_site", "publish_site"]
+    assert sorted(registry.function_mappings) == expected
+    assert sorted(registry.function_info) == expected
     assert sorted(s["function"]["name"] for s in registry.openai_function_schemas) == [
-        "get_site", "local_tool", "publish_site",
+        *expected,
     ]
 
 
@@ -89,11 +94,11 @@ def test_protect_publish_token_saves_token_and_hides_it(tmp_path):
             "result": json.dumps({"url": "https://example.deed.page/", "token": "secret-token"}),
         }
 
-    registry.function_mappings["publish_site"] = fake_publish_site
+    registry.function_mappings["deedpage__publish_site"] = fake_publish_site
     token_file = tmp_path / "token"
     assert module.protect_publish_token(registry, token_file) is True
 
-    result = asyncio.run(registry.function_mappings["publish_site"](files={"index.html": "<h1>x</h1>"}))
+    result = asyncio.run(registry.function_mappings["deedpage__publish_site"](files={"index.html": "<h1>x</h1>"}))
 
     assert calls == [{"files": {"index.html": "<h1>x</h1>"}}]
     assert "secret-token" not in result["result"]

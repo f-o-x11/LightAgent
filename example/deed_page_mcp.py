@@ -29,6 +29,8 @@ import asyncio
 import inspect
 import json
 import os
+import stat
+import tempfile
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -36,11 +38,15 @@ from typing import Any
 DEED_PAGE_MCP_URL = "https://deed.page/mcp"
 SERVER_NAME = "deedpage"
 TOKEN_ENV = "DEEDPAGE_TOKEN"
-DEFAULT_TOKEN_FILE = ".deedpage-token"
+DEFAULT_TOKEN_FILE = str(
+    Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    / "lightagent" / "credentials" / "deedpage.token"
+)
+TOOL_PREFIX = f"{SERVER_NAME}__"
 # publish_site and get_site are enough for "write a page, return the link".
 # The server also exposes delete_site, rotate_token, add_domain and others;
 # keep those away from the model unless the application needs them.
-DEFAULT_ALLOWED_TOOLS = ("publish_site", "get_site")
+DEFAULT_ALLOWED_TOOLS = (f"{TOOL_PREFIX}publish_site", f"{TOOL_PREFIX}get_site")
 
 SAMPLE_PAGE = """<!doctype html>
 <html lang="en">
@@ -53,15 +59,23 @@ SAMPLE_PAGE = """<!doctype html>
 """
 
 
-def deed_page_mcp_config(env: Mapping[str, str] | None = None) -> dict[str, Any]:
+def deed_page_mcp_config(
+        env: Mapping[str, str] | None = None,
+        *, token_file: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
     """Return an ``mcp_setting`` dict for ``LightAgent.setup_mcp``.
 
     The token is read by Python from the environment; LightAgent does not
     interpolate header strings.
     """
     env = os.environ if env is None else env
-    server: dict[str, Any] = {"transport": "streamable-http", "url": DEED_PAGE_MCP_URL}
+    server: dict[str, Any] = {
+        "transport": "streamable-http", "url": DEED_PAGE_MCP_URL,
+        "namespace": SERVER_NAME, "namespace_tools": True,
+    }
     token = (env.get(TOKEN_ENV) or "").strip()
+    if not token and token_file is not None:
+        token = read_token(token_file)
     if token:
         server["headers"] = {"Authorization": f"Bearer {token}"}
     return {"mcpServers": {SERVER_NAME: server}}
@@ -80,31 +94,86 @@ def split_token(result_text: str) -> tuple[str, str | None]:
     if not isinstance(payload, dict) or "token" not in payload:
         return result_text, None
     token = payload.pop("token")
-    payload["token_saved"] = True
     return json.dumps(payload), str(token) if token else None
 
 
 def save_token(token: str, token_file: str | os.PathLike[str]) -> Path:
-    """Write the owner token to ``token_file`` readable only by the current user."""
+    """Atomically publish a private token file without replacing another token."""
     path = Path(token_file)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(token)
-    os.chmod(path, 0o600)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if path.parent.is_symlink() or stat.S_IMODE(path.parent.stat().st_mode) & 0o022:
+        raise PermissionError("Token directory must not be a symlink or writable by other users")
+    existing = read_token(path)
+    if existing is not None:
+        if existing != token:
+            raise FileExistsError("Refusing to replace an existing owner token")
+        return path
+    fd, temporary = tempfile.mkstemp(prefix=".deedpage-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(token)
+            handle.flush()
+            os.fsync(handle.fileno())
+        # A hard link publishes a complete file atomically and refuses an
+        # existing destination, including a symlink created during this write.
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError:
+            if read_token(path) != token:
+                raise FileExistsError("Refusing to replace an existing owner token") from None
+    finally:
+        os.unlink(temporary)
     return path
+
+
+def read_token(token_file: str | os.PathLike[str]) -> str | None:
+    """Read only an owner-only regular file, without following symlinks."""
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise RuntimeError("Secure token files require O_NOFOLLOW; use DEEDPAGE_TOKEN on this platform")
+    try:
+        fd = os.open(token_file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, "r", encoding="utf-8") as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("Token file must be a regular file")
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+            raise PermissionError("Token file must be owned by the current user with mode 0600")
+        token = handle.read().strip()
+    if not token:
+        raise ValueError("Token file is empty")
+    return token
+
+
+def credential_headers(token_file: str | os.PathLike[str]) -> dict[str, str]:
+    token = (os.environ.get(TOKEN_ENV) or "").strip() or read_token(token_file)
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def protected_result(result_text: str, token_file: str | os.PathLike[str]) -> str:
+    cleaned, token = split_token(result_text)
+    if token:
+        save_token(token, token_file)
+        payload = json.loads(cleaned)
+        payload["token_saved"] = True
+        return json.dumps(payload)
+    return cleaned
 
 
 def restrict_new_tools(tool_registry: Any, before: Iterable[str], allowed: Iterable[str]) -> list[str]:
     """Drop tools registered since ``before`` unless they are in ``allowed``.
 
-    Call this right after ``setup_mcp`` with the tool names that existed before
-    it, so local tools are never touched. Returns the removed names.
+    Only the reserved deedpage namespace is affected. The before snapshot must
+    not contain that namespace; setup checks this before connecting.
     """
-    before_set = set(before)
+    if any(name.startswith(TOOL_PREFIX) for name in before):
+        raise ValueError("The deedpage namespace is already in use")
     allowed_set = set(allowed)
     removed = [
         name for name in list(tool_registry.function_mappings)
-        if name not in before_set and name not in allowed_set
+        if name.startswith(TOOL_PREFIX) and name not in allowed_set
     ]
     for name in removed:
         tool_registry.function_mappings.pop(name, None)
@@ -118,7 +187,8 @@ def restrict_new_tools(tool_registry: Any, before: Iterable[str], allowed: Itera
 
 def protect_publish_token(tool_registry: Any, token_file: str | os.PathLike[str]) -> bool:
     """Wrap the registered ``publish_site`` so a returned owner token is saved, not shown."""
-    original = tool_registry.function_mappings.get("publish_site")
+    tool_name = f"{TOOL_PREFIX}publish_site"
+    original = tool_registry.function_mappings.get(tool_name)
     if original is None:
         return False
 
@@ -127,14 +197,45 @@ def protect_publish_token(tool_registry: Any, token_file: str | os.PathLike[str]
         if inspect.isawaitable(result):
             result = await result
         if isinstance(result, dict) and isinstance(result.get("result"), str):
-            cleaned, token = split_token(result["result"])
-            if token:
-                save_token(token, token_file)
-            result = {**result, "result": cleaned}
+            result = {**result, "result": protected_result(result["result"], token_file)}
         return result
 
-    tool_registry.function_mappings["publish_site"] = publish_site
+    tool_registry.function_mappings[tool_name] = publish_site
     return True
+
+
+async def setup_deed_page(agent: Any, token_file: str | os.PathLike[str]) -> None:
+    """Reserve the MCP namespace and install credentials and result protection."""
+    if any(name.startswith(TOOL_PREFIX) for name in agent.tool_registry.function_mappings):
+        raise ValueError("The deedpage namespace is already in use")
+    if getattr(agent, "mcp_client", None) is not None:
+        raise ValueError("Use a separate agent instead of replacing an existing MCP client")
+    config = deed_page_mcp_config(token_file=token_file)
+    try:
+        await agent.setup_mcp(mcp_setting=config)
+    finally:
+        # Bootstrap credentials are needed during discovery; later calls must
+        # use the live resolver so deleted/revoked credentials cannot linger.
+        config["mcpServers"][SERVER_NAME].pop("headers", None)
+        restrict_new_tools(agent.tool_registry, (), DEFAULT_ALLOWED_TOOLS)
+        protected = protect_publish_token(agent.tool_registry, token_file)
+    if agent.mcp_client is None:
+        raise RuntimeError("MCP setup failed")
+    agent.mcp_client.credential_provider = (
+        lambda server, config: credential_headers(token_file) if server == SERVER_NAME else {}
+    )
+    if not protected:
+        raise RuntimeError("The deedpage publishing tool is unavailable")
+
+
+async def refresh_deed_page(agent: Any, token_file: str | os.PathLike[str]) -> None:
+    try:
+        await agent.mcp_client.refresh_tools(SERVER_NAME)
+    finally:
+        restrict_new_tools(agent.tool_registry, (), DEFAULT_ALLOWED_TOOLS)
+        protected = protect_publish_token(agent.tool_registry, token_file)
+    if not protected:
+        raise RuntimeError("The deedpage publishing tool is unavailable")
 
 
 async def publish_direct(html: str, ttl_seconds: int | None, token_file: str) -> dict[str, Any]:
@@ -142,14 +243,18 @@ async def publish_direct(html: str, ttl_seconds: int | None, token_file: str) ->
     from LightAgent.mcp_client_manager import MCPClientManager
     from LightAgent.tools import ToolRegistry
 
-    manager = MCPClientManager(deed_page_mcp_config(), ToolRegistry())
+    manager = MCPClientManager(
+        deed_page_mcp_config(env={}), ToolRegistry(),
+        credential_provider=lambda server, config: credential_headers(token_file) if server == SERVER_NAME else {},
+    )
     arguments: dict[str, Any] = {"files": {"index.html": html}}
     if ttl_seconds:
         arguments["ttl_seconds"] = ttl_seconds
-    response = await manager.call_tool("publish_site", arguments, target_server=SERVER_NAME)
-    cleaned, token = split_token(response["result"])
-    if token:
-        save_token(token, token_file)
+    try:
+        response = await manager.call_tool("publish_site", arguments, target_server=SERVER_NAME)
+    finally:
+        await manager.cleanup()
+    cleaned = protected_result(response["result"], token_file)
     return json.loads(cleaned)
 
 
@@ -166,10 +271,7 @@ def run_agent(task: str, token_file: str) -> str:
         base_url=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
         role="You write small, self-contained HTML pages and publish them when asked.",
     )
-    before = set(agent.tool_registry.function_mappings)
-    asyncio.run(agent.setup_mcp(mcp_setting=deed_page_mcp_config()))
-    restrict_new_tools(agent.tool_registry, before, DEFAULT_ALLOWED_TOOLS)
-    protect_publish_token(agent.tool_registry, token_file)
+    asyncio.run(setup_deed_page(agent, token_file))
     return agent.run(task, stream=False)
 
 
@@ -181,7 +283,7 @@ def main() -> None:
     parser.add_argument(
         "--task",
         default=(
-            "Write a one-page HTML summary of what LightAgent is, then publish it with publish_site "
+            "Write a one-page HTML summary of what LightAgent is, then publish it with deedpage__publish_site "
             "using files {\"index.html\": <the html>} and ttl_seconds 3600. Reply with the URL."
         ),
     )
